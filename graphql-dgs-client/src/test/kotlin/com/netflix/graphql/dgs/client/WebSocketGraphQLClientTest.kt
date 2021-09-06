@@ -42,6 +42,7 @@ import org.springframework.web.reactive.socket.WebSocketMessage
 import org.springframework.web.reactive.socket.WebSocketSession
 import org.springframework.web.reactive.socket.client.WebSocketClient
 import reactor.core.publisher.Flux
+import reactor.core.publisher.Mono
 import reactor.test.StepVerifier
 import reactor.test.publisher.TestPublisher
 import java.lang.Exception
@@ -69,6 +70,7 @@ class WebSocketGraphQLClientTest {
         server = TestPublisher.createCold()
 
         every { subscriptionsClient.receive() } returns server.flux()
+//        every { subscriptionsClient.communicateWithServer() } returns Mono.empty()
     }
 
     @Test
@@ -251,6 +253,25 @@ class WebSocketGraphQLClientTest {
     }
 
     @Test
+    fun makesSingleHandshakeForMultipleSubscriptions() {
+        server.next(CONNECTION_ACK_MESSAGE)
+        server.next(dataMessage(TEST_DATA_A, "1"))
+        server.next(dataMessage(TEST_DATA_B, "2"))
+        server.next(completeMessage("2"))
+        server.next(dataMessage(TEST_DATA_C, "1"))
+        server.next(completeMessage("1"))
+
+        val responses1 = client.reactiveExecuteQuery("", emptyMap())
+        val responses2 = client.reactiveExecuteQuery("", emptyMap())
+
+        Flux.merge(responses1, responses2).blockLast()
+
+        verify(exactly = 1) { subscriptionsClient.communicateWithServer() }
+        verify(exactly = 3) { subscriptionsClient.send(any()) }
+        verify(exactly = 3) { subscriptionsClient.receive() }
+    }
+
+    @Test
     fun retriesAfterCompleteIfInstructed() {
         server.next(CONNECTION_ACK_MESSAGE)
         server.next(dataMessage(TEST_DATA_A, "1"))
@@ -285,6 +306,7 @@ class WebSocketGraphQLClientTest {
         val websocketClient = mockOperationMessageClient(Flux.empty())
 
         val messageClient = OperationMessageWebSocketClient("", websocketClient)
+        messageClient.communicateWithServer().subscribe()
         StepVerifier.create(messageClient.receive())
             .expectSubscription()
             .expectComplete()
@@ -296,6 +318,7 @@ class WebSocketGraphQLClientTest {
         val websocketClient = mockOperationMessageClient(Flux.error(Exception()))
 
         val messageClient = OperationMessageWebSocketClient("", websocketClient)
+        messageClient.communicateWithServer().subscribe()
         StepVerifier.create(messageClient.receive())
             .expectSubscription()
             .expectError()

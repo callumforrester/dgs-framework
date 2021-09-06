@@ -24,6 +24,7 @@ import org.springframework.web.reactive.socket.WebSocketMessage
 import org.springframework.web.reactive.socket.WebSocketSession
 import org.springframework.web.reactive.socket.client.ReactorNettyWebSocketClient
 import org.springframework.web.reactive.socket.client.WebSocketClient
+import reactor.core.Disposable
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
 import reactor.core.publisher.Sinks
@@ -31,6 +32,7 @@ import reactor.util.concurrent.Queues
 import java.net.URI
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Reactive client implementation using websockets and the subscription-transport-ws protocol:
@@ -70,20 +72,34 @@ class WebSocketGraphQLClient(
 
     // The handshake represents a connection to the server, it is cached so that there is one per client instance.
     // The handshake only completes once the connection has been establishes and a GQL_CONNECTION_ACK message has been
-    // received from the server
+    // received from the server. If the connection closes it is reestablished and the handshake is reperformed on the
+    // next downstream subscribe.
+    // TODO: This functionality can be achieved more easily with Mono::cacheInvalidateIf, which is available in the
+    //       next release of reactors (v3.4.8: https://github.com/reactor/reactor-core/releases/tag/v3.4.8)
+    private val connection = AtomicReference<Disposable?>(null)
     private val handshake = Mono.defer {
-        client.send(CONNECTION_INIT_MESSAGE)
-        client.receive()
-            .take(1)
-            .map {
-                if (it.type == GQL_CONNECTION_ACK)
-                    it
-                else
-                    throw GraphQLException("Acknowledgement expected from server, received $it")
-            }
-            .timeout(acknowledgementTimeout)
-            .then()
-    }.cache()
+        if (connection.get()?.isDisposed != false)
+            doHandshake()
+        else
+            Mono.empty()
+    }
+
+    private fun doHandshake(): Mono<Void> {
+        connection.set(client.communicateWithServer().subscribe())
+        return Mono.defer {
+            client.send(CONNECTION_INIT_MESSAGE)
+            client.receive()
+                .take(1)
+                .map { message ->
+                    if (message.type == GQL_CONNECTION_ACK)
+                        message
+                    else
+                        throw GraphQLException("Acknowledgement expected from server, received $message")
+                }
+                .timeout(acknowledgementTimeout)
+                .then()
+        }
+    }
 
     override fun reactiveExecuteQuery(
         query: String,
@@ -185,14 +201,8 @@ class OperationMessageWebSocketClient(
         .onBackpressureBuffer<OperationMessage>(Queues.SMALL_BUFFER_SIZE, false)
     private val outgoingSink = Sinks
         .many()
-        .unicast()
+        .multicast()
         .onBackpressureBuffer<OperationMessage>()
-    private val conn = Mono
-        .defer {
-            val uri = URI(url)
-            client.execute(uri) { exchange(incomingSink, outgoingSink, it) }
-        }
-        .cache()
 
     /**
      * Send a message to the server, the message is buffered for sending later if connection has not been established
@@ -210,9 +220,17 @@ class OperationMessageWebSocketClient(
      */
     fun receive(): Flux<OperationMessage> {
         return Flux.defer {
-            conn.subscribe()
-            incomingSink.asFlux()
+            val incomingMessages = incomingSink.asFlux()
+            incomingMessages
         }
+    }
+
+    fun communicateWithServer(): Mono<Void> {
+        return Mono
+            .defer {
+                val uri = URI(url)
+                client.execute(uri) { exchange(incomingSink, outgoingSink, it) }
+            }
     }
 
     private fun exchange(
@@ -224,10 +242,12 @@ class OperationMessageWebSocketClient(
         val incomingDeserialized = session
             .receive()
             // Ensure the output flux collapses neatly if the socket closes or an error occurs
-            .doOnComplete { incomingMessages.tryEmitComplete().orThrow() }
-            .doOnError { incomingMessages.tryEmitError(it) }
+            .doOnComplete {
+                incomingMessages.tryEmitComplete().orThrow()
+            }
+            .doOnError { incomingMessages.tryEmitError(it).orThrow() }
             .map(this::decodeMessage)
-            .doOnNext(incomingMessages::tryEmitNext)
+            .doOnNext { incomingMessages.tryEmitNext(it).orThrow() }
         val outgoingSerialized = session
             .send(
                 outgoingMessages
