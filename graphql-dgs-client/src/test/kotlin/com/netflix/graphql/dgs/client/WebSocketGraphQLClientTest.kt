@@ -42,6 +42,7 @@ import org.springframework.web.reactive.socket.WebSocketMessage
 import org.springframework.web.reactive.socket.WebSocketSession
 import org.springframework.web.reactive.socket.client.WebSocketClient
 import reactor.core.publisher.Flux
+import reactor.core.publisher.Hooks
 import reactor.core.publisher.Mono
 import reactor.test.StepVerifier
 import reactor.test.publisher.TestPublisher
@@ -302,6 +303,25 @@ class WebSocketGraphQLClientTest {
     }
 
     @Test
+    fun reconnectsToServer() {
+        server.next(CONNECTION_ACK_MESSAGE)
+        server.next(dataMessage(TEST_DATA_A, "1"))
+        server.error(Exception())
+
+        every { subscriptionsClient.communicateWithServer() } returns Mono.empty()
+
+        val responses = client.reactiveExecuteQuery("", emptyMap()).retry(1)
+        StepVerifier.create(responses.map { it.extractValue<Int>("a") })
+            .expectSubscription()
+            .expectNext(1)
+            .expectNext(1)
+            .expectError()
+            .verify(VERIFY_TIMEOUT)
+
+        verify(exactly = 2) { subscriptionsClient.communicateWithServer() }
+    }
+
+    @Test
     fun operationMessageClientForwardsComplete() {
         val websocketClient = mockOperationMessageClient(Flux.empty())
 
@@ -309,7 +329,7 @@ class WebSocketGraphQLClientTest {
         messageClient.communicateWithServer().subscribe()
         StepVerifier.create(messageClient.receive())
             .expectSubscription()
-            .expectComplete()
+            .expectError()
             .verify(VERIFY_TIMEOUT)
     }
 
@@ -325,11 +345,35 @@ class WebSocketGraphQLClientTest {
             .verify(VERIFY_TIMEOUT)
     }
 
+    @Test
+    fun operationMessageClientReconnectsToServer() {
+        Hooks.onErrorDropped {
+            throw RuntimeException(it)
+        }
+
+        val websocketClient = mockOperationMessageClient(Flux.empty())
+
+        val messageClient = OperationMessageWebSocketClient("", websocketClient)
+        val conn1 = messageClient.communicateWithServer().doOnSuccess { println("CONN OVER!") }.subscribe()
+        StepVerifier.create(messageClient.receive())
+            .expectSubscription()
+            .expectError()
+            .verify(VERIFY_TIMEOUT)
+
+        val conn2 = messageClient.communicateWithServer().doOnSuccess { println("CONN OVER!") }.subscribe()
+        StepVerifier.create(messageClient.receive())
+            .expectSubscription()
+            .expectError()
+            .verify(VERIFY_TIMEOUT)
+
+        verify(exactly = 2) { websocketClient.execute(any(), any()) }
+    }
+
     private fun mockOperationMessageClient(messages: Flux<WebSocketMessage>): WebSocketClient {
         val websocketClient = mockk<WebSocketClient>(relaxed = true)
         val session = mockk<WebSocketSession>(relaxed = true)
         val handler = slot<WebSocketHandler>()
-        every { session.receive() } returns messages
+        every { session.receive() } returns messages.doOnComplete(session::close)
         every { websocketClient.execute(any(), capture(handler)) } answers {
             handler.captured.handle(session)
         }

@@ -31,6 +31,7 @@ import reactor.core.publisher.Sinks
 import reactor.util.concurrent.Queues
 import java.net.URI
 import java.time.Duration
+import java.util.*
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
@@ -78,10 +79,14 @@ class WebSocketGraphQLClient(
     //       next release of reactors (v3.4.8: https://github.com/reactor/reactor-core/releases/tag/v3.4.8)
     private val connection = AtomicReference<Disposable?>(null)
     private val handshake = Mono.defer {
-        if (connection.get()?.isDisposed != false)
+        println("CHECKING CONNECTION")
+        if (connection.get()?.isDisposed != false) {
+            println("NEW CONNECTION")
             doHandshake()
-        else
+        } else {
+            println("KEEP OLD CONNECTION")
             Mono.empty()
+        }
     }
 
     private fun doHandshake(): Mono<Void> {
@@ -113,6 +118,7 @@ class WebSocketGraphQLClient(
         variables: Map<String, Any>,
         operationName: String?,
     ): Flux<GraphQLResponse> {
+        println("QUERY $query")
         // Generate a unique number for each subscription in the same session.
         val subscriptionId = subscriptionCount
             .incrementAndGet()
@@ -202,7 +208,7 @@ class OperationMessageWebSocketClient(
     private val outgoingSink = Sinks
         .many()
         .multicast()
-        .onBackpressureBuffer<OperationMessage>()
+        .onBackpressureBuffer<OperationMessage>(Queues.SMALL_BUFFER_SIZE, false)
 
     /**
      * Send a message to the server, the message is buffered for sending later if connection has not been established
@@ -220,8 +226,8 @@ class OperationMessageWebSocketClient(
      */
     fun receive(): Flux<OperationMessage> {
         return Flux.defer {
-            val incomingMessages = incomingSink.asFlux()
-            incomingMessages
+            incomingSink
+                .asFlux()
         }
     }
 
@@ -229,28 +235,25 @@ class OperationMessageWebSocketClient(
         return Mono
             .defer {
                 val uri = URI(url)
-                client.execute(uri) { exchange(incomingSink, outgoingSink, it) }
+                client.execute(uri, this::exchange)
             }
     }
 
     private fun exchange(
-        incomingMessages: Sinks.Many<OperationMessage>,
-        outgoingMessages: Sinks.Many<OperationMessage>,
         session: WebSocketSession
     ): Mono<Void> {
         // Create chains to handle de/serialization
         val incomingDeserialized = session
             .receive()
-            // Ensure the output flux collapses neatly if the socket closes or an error occurs
-            .doOnComplete {
-                incomingMessages.tryEmitComplete().orThrow()
-            }
-            .doOnError { incomingMessages.tryEmitError(it).orThrow() }
+            .doOnComplete { incomingSink
+                .tryEmitError(GraphQLException("Server unexpectedly closed the connection"))
+                .orThrow() }
+            .doOnError { incomingSink.tryEmitError(it).orThrow() }
             .map(this::decodeMessage)
-            .doOnNext { incomingMessages.tryEmitNext(it).orThrow() }
+            .doOnNext { incomingSink.tryEmitNext(it).orThrow() }
         val outgoingSerialized = session
             .send(
-                outgoingMessages
+                outgoingSink
                     .asFlux()
                     .map { createMessage(session, it) }
             )
